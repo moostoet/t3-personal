@@ -1,0 +1,117 @@
+# Keeps this fork up to date with upstream (pingdotgg/t3code).
+#
+# Branches:
+#   main      Exact mirror of upstream/main. Don't commit here; it only ever fast-forwards.
+#   personal  Default branch: upstream plus your own changes. Work here.
+#
+# Every 6 hours (or on demand: Actions tab, or `gh workflow run sync-upstream.yml`):
+#   1. Fast-forward `main` to upstream/main.
+#   2. Merge `main` into `personal`. On conflict nothing is pushed and the run fails;
+#      the run summary lists the conflicting files and how to resolve them locally.
+#   3. Disable every workflow not listed in ENABLED_WORKFLOWS, so upstream's CI,
+#      release and deploy jobs (which need upstream's secrets) don't run here.
+#
+# Upstream commits that touch .github/workflows/ can only be pushed with a token that
+# has the Workflows permission, which the built-in GITHUB_TOKEN never has. Store a
+# fine-grained PAT (this repo only; Contents + Workflows: read and write) as the
+# SYNC_TOKEN repository secret. Without it, syncing stops at the first such commit.
+
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+
+env:
+  UPSTREAM_REPO: pingdotgg/t3code
+  UPSTREAM_BRANCH: main
+  MIRROR_BRANCH: main
+  PERSONAL_BRANCH: personal
+  # Space-separated workflow file names to keep enabled here, e.g. "sync-upstream.yml ci.yml".
+  ENABLED_WORKFLOWS: sync-upstream.yml
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      HAS_SYNC_TOKEN: ${{ secrets.SYNC_TOKEN != '' }}
+    steps:
+      - name: Warn about missing SYNC_TOKEN
+        if: env.HAS_SYNC_TOKEN != 'true'
+        run: echo "::warning::SYNC_TOKEN secret is not set; upstream commits that change .github/workflows/ will be rejected."
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.PERSONAL_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Fast-forward mirror branch
+        run: |
+          git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          if ! git push origin "refs/remotes/upstream/$UPSTREAM_BRANCH:refs/heads/$MIRROR_BRANCH"; then
+            {
+              echo "## Couldn't update \`$MIRROR_BRANCH\`"
+              echo "- *refusing to allow a GitHub App to create or update workflow*: set the \`SYNC_TOKEN\` secret (see the top of sync-upstream.yml)."
+              echo "- *non-fast-forward*: \`$MIRROR_BRANCH\` has commits that aren't upstream. Move them to \`$PERSONAL_BRANCH\`, then reset \`$MIRROR_BRANCH\` to \`upstream/$UPSTREAM_BRANCH\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Merge upstream into personal branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          upstream_ref="refs/remotes/upstream/$UPSTREAM_BRANCH"
+          upstream_sha=$(git rev-parse --short "$upstream_ref")
+
+          if git merge-base --is-ancestor "$upstream_ref" HEAD; then
+            echo "\`$PERSONAL_BRANCH\` already contains upstream $upstream_sha." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if git merge --no-edit -m "Merge $UPSTREAM_REPO@$upstream_sha into $PERSONAL_BRANCH" "$upstream_ref"; then
+            git push origin "HEAD:refs/heads/$PERSONAL_BRANCH"
+            echo "Merged upstream $upstream_sha into \`$PERSONAL_BRANCH\`." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          conflicts=$(git diff --name-only --diff-filter=U)
+          git merge --abort
+          {
+            echo "## Merge conflict: resolve locally"
+            echo "Conflicting files:"
+            echo '```'
+            echo "$conflicts"
+            echo '```'
+            echo '```sh'
+            echo "git switch $PERSONAL_BRANCH && git pull"
+            echo "git fetch upstream && git merge upstream/$UPSTREAM_BRANCH"
+            echo "# fix the conflicts, then"
+            echo "git commit && git push"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Merging upstream $upstream_sha into $PERSONAL_BRANCH conflicts; see the run summary."
+          exit 1
+
+      - name: Disable other workflows
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows" --paginate \
+            --jq '.workflows[] | select(.state == "active" and (.path | startswith(".github/workflows/"))) | "\(.id) \(.path | ltrimstr(".github/workflows/"))"' |
+          while read -r id file; do
+            case " $ENABLED_WORKFLOWS " in *" $file "*) continue ;; esac
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$id/disable"
+            echo "Disabled $file" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
