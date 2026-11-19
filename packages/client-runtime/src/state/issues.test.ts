@@ -189,7 +189,7 @@ describe("createMergedIssueListAtoms", () => {
   it("refreshes the open listings of the environment written to", () => {
     const reads = new Map<string, number>();
     const lists = new Map<string, Atom.Atom<AsyncResult.AsyncResult<IssueListResult>>>();
-    const listings = createMergedIssueListAtoms((target) => {
+    const list = (target: IssueListTarget) => {
       const key = `${target.environmentId}:${target.input.query}`;
       const existing = lists.get(key);
       if (existing !== undefined) return existing;
@@ -199,7 +199,11 @@ describe("createMergedIssueListAtoms", () => {
       });
       lists.set(key, atom);
       return atom;
-    }, String);
+    };
+    const listings = createMergedIssueListAtoms(
+      { list, refreshList: (registry, target) => registry.refresh(list(target)) },
+      String,
+    );
     const registry = AtomRegistry.make();
     const written = EnvironmentId.make("written");
     const other = EnvironmentId.make("other");
@@ -218,11 +222,44 @@ describe("createMergedIssueListAtoms", () => {
     }
   });
 
+  it("retries only failed environments, leaving one still loading to finish", () => {
+    const registry = AtomRegistry.make();
+    const targets = ["slow", "flaky"].map((environmentId) => ({
+      environmentId: EnvironmentId.make(environmentId),
+      input: { state: "open" as const },
+    }));
+    const requests: string[] = [];
+    const lists = Atom.family((environmentId: string) =>
+      Atom.make(
+        Effect.suspend(() => {
+          requests.push(environmentId);
+          return environmentId === "flaky" ? Effect.fail("Tracker unavailable") : Effect.never;
+        }),
+      ),
+    );
+    const listings = createMergedIssueListAtoms(
+      { list: (target) => lists(target.environmentId), refreshList: () => {} },
+      () => "Tracker unavailable",
+    );
+    const view = listings.atom(targets);
+    const unmount = registry.mount(view);
+    try {
+      expect(registry.get(view)).toMatchObject({ error: "Tracker unavailable", isPending: true });
+
+      listings.retry(registry, targets);
+
+      expect(requests).toEqual(["slow", "flaky", "flaky"]);
+    } finally {
+      unmount();
+      registry.dispose();
+    }
+  });
+
   it("releases historical search targets when the list closes", async () => {
     NodeV8.setFlagsFromString("--expose-gc");
     const gc = NodeVM.runInNewContext("gc") as () => void;
     const listings = createMergedIssueListAtoms(
-      () => Atom.make(AsyncResult.success(answer)),
+      { list: () => Atom.make(AsyncResult.success(answer)), refreshList: () => {} },
       String,
     );
     const registry = AtomRegistry.make();
